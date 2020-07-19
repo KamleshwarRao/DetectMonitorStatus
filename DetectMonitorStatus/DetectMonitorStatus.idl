@@ -1,0 +1,18 @@
+// DetectMonitorStatus.idl : IDL source for DetectMonitorStatus
+//
+
+// This file will be processed by the MIDL tool to
+// produce the type library (DetectMonitorStatus.tlb) and marshalling code.
+
+import "oaidl.idl";
+import "ocidl.idl";
+
+[
+	uuid(f94fd8db-86d3-4e6e-9c8c-5634a50f8add),
+	version(1.0),
+]
+library DetectMonitorStatusLib
+{
+	importlib("stdole2.tlb");
+};
+
