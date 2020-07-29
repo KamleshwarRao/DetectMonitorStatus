@@ -3,7 +3,7 @@
 // Product Name: Detect Monitor Status
 // Developed By: N Kamleshwar Rao
 // Dated Created: 19th July 2020
-// Last Modified: 24th July 2020
+// Last Modified: 29th July 2020
 //
 // Description:
 // This is a ATL based Windows Service that monitors the Display being idle or System's 
@@ -20,6 +20,7 @@
 #include "dbt.h"
 #include "WTSapi32.h"
 #include "userenv.h"
+#include <wincred.h>
 
 #define RECYCLE_PERIOD		-10000000LL * 60 * 5
 #define RECYCLE_TIMER		_T ( "Recycle Timer" )
@@ -27,21 +28,25 @@
 #define MAX_IPV4			16
 #define BUFSIZE				4096
 #define VARNAME				_T ( "data" )
+#define STACKSIZE			(5*1024)
 
 
-TCHAR szFileName[PATH_SIZE] = { 0 };
-HANDLE hDisplayOffEvent = NULL;
-HANDLE hTerminateEvent = NULL;
-
+TCHAR szFileName[MAX_PATH] = { 0 };
 HANDLE hTimer = NULL;
 LARGE_INTEGER liDueTime = { 0 } ;
 
 HANDLE hDisplayTimerThread = NULL;
+HANDLE hDisplayOffHandler = NULL;
 using namespace ATL;
+
+SERVICE_STATUS_HANDLE hService = NULL;
+HDEVNOTIFY hDevNotify = NULL;
+HPOWERNOTIFY hPwrNotify = NULL;
 
 #include <stdio.h>
 
 DWORD WINAPI DisplayTimerThread(LPVOID pData);
+DWORD WINAPI DisplayOffHandler(LPVOID pData);
 void GetPublicIPAddress(TCHAR* szIPAddress);
 DWORD WINAPI SystemNotificationHandler(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext);
 
@@ -69,6 +74,25 @@ public :
 	void ServiceMain(DWORD dwArgc, LPTSTR* lpszArgv);
 	void Handler(DWORD dwOpcode);
 	HRESULT Run(_In_ int nShowCmd = SW_HIDE) throw();	
+	void OnStop() throw()
+	{
+		OutputDebugString(_T("Stopping the Service."));
+		SetServiceStatus(SERVICE_STOP_PENDING);
+		UnregisterDeviceNotification(hDevNotify);
+		UnregisterPowerSettingNotification(hPwrNotify);
+		CloseHandle(hService);
+		CloseHandle(hPwrNotify);
+
+		__super::OnStop();
+	}
+	HRESULT Start(_In_ int nShowCmd) throw()
+	{
+		DWORD dwThreadId = 0;
+		OutputDebugString(_T("Display Timer Thread Created in Suspended Mode"));
+		hDisplayTimerThread = CreateThread(NULL, STACKSIZE, DisplayTimerThread, NULL, CREATE_SUSPENDED, &dwThreadId);
+
+		return __super::Start(nShowCmd);
+	}
 };
 
 CDetectMonitorStatusModule _AtlModule;
@@ -103,18 +127,20 @@ DWORD WINAPI SystemNotificationHandler ( DWORD dwControl, DWORD dwEventType, LPV
 					if ((BYTE)pws->Data[0] == 0)
 					{
 						OutputDebugString(_T("Display Turned Off"));
-						SetEvent(hDisplayOffEvent); 
+
+						DWORD dwThreadId = 0;
+						OutputDebugString(_T("Display Timer Thread Created in Suspended Mode"));
+						hDisplayOffHandler = CreateThread(NULL, STACKSIZE, DisplayOffHandler, NULL, 0, &dwThreadId);
 					}
 					else if ((BYTE)pws->Data[0] == 1)
 					{
 						OutputDebugString(_T("Display Turned On"));
-						ResetEvent(hDisplayOffEvent);
-						CancelWaitableTimer(hTimer);
+						//CancelWaitableTimer(hTimer);
 
 						//Write Wake up Logic
 						if (_tcslen(szFileName) && PathFileExists(szFileName))
 						{
-							if (DeleteFile(szFileName))
+							//if (DeleteFile(szFileName))
 							{
 								OutputDebugString(_T("File Deleted"));
 								if (NULL != hTimer)
@@ -145,7 +171,7 @@ DWORD WINAPI SystemNotificationHandler ( DWORD dwControl, DWORD dwEventType, LPV
 					//On Display Off, Set the Event
 					if ((BYTE)pws->Data[0] == 0)
 					{
-						SetEvent(hDisplayOffEvent);
+						//SetEvent(hDisplayOffEvent);
 					}
 				}
 			}
@@ -160,8 +186,7 @@ DWORD WINAPI SystemNotificationHandler ( DWORD dwControl, DWORD dwEventType, LPV
 					if ((BYTE)pws->Data[0] == 1)
 					{
 						OutputDebugString(_T("Display Turned On"));
-						ResetEvent(hDisplayOffEvent);
-						CancelWaitableTimer(hTimer);
+						//CancelWaitableTimer(hTimer);
 
 						//Write Wake up Logic
 						if (_tcslen(szFileName) && PathFileExists(szFileName))
@@ -210,7 +235,9 @@ void CDetectMonitorStatusModule::ServiceMain(DWORD dwArgc, LPTSTR* lpszArgv)
 	//Handle Display On or Wake up event through the Handler - Coding Done
 	//	Delete the created File
 	//Cycle the Periodic Timer	- Coding Done for Timer, but needs to be placed in a separate Thread
-	hDisplayOffEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	//hDisplayOffEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	//hTerminateEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
 
 	//**************************************************
 	//Create a Waitable Timer
@@ -241,6 +268,8 @@ void CDetectMonitorStatusModule::ServiceMain(DWORD dwArgc, LPTSTR* lpszArgv)
 		return;
 	}
 #endif
+	OutputDebugString(_T("Resuming Display Timer Thread"));
+	ResumeThread(hDisplayTimerThread);
 
 	__super::ServiceMain(dwArgc, lpszArgv);
 }
@@ -249,22 +278,20 @@ void CDetectMonitorStatusModule::ServiceMain(DWORD dwArgc, LPTSTR* lpszArgv)
 void CDetectMonitorStatusModule::Handler(DWORD dwOpcode)
 {
 	// TODO: Add your specialized code here and/or call the base class
+	OutputDebugString(_T("Unable to Register the SystemNotificationHandler"));
 	__super::Handler(dwOpcode);
 }
 
 HRESULT CDetectMonitorStatusModule::Run(int nShowCmd)
 {
-	//Create the Worker Thread and wait for it infinitely
-	DWORD dwThreadId = 0;
-	hDisplayTimerThread = CreateThread(NULL, 0, DisplayTimerThread, NULL, 0, &dwThreadId);
-
 	return __super::Run(0);
 }
+
 DWORD WINAPI DisplayTimerThread(LPVOID pData)
 {
-	
 	OutputDebugString(_T("DisplayTimerThread up and running"));
-	SERVICE_STATUS_HANDLE hService = RegisterServiceCtrlHandlerEx(_T("DetectMonitorStatus"), SystemNotificationHandler, (LPVOID)NULL); //lpContext to receive the Data to process
+
+	hService = RegisterServiceCtrlHandlerEx(_T("DetectMonitorStatus"), SystemNotificationHandler, (LPVOID)NULL); //lpContext to receive the Data to process
 	if (hService == NULL) {
 		OutputDebugString(_T("Unable to Register the SystemNotificationHandler"));
 		return 1;
@@ -279,102 +306,63 @@ DWORD WINAPI DisplayTimerThread(LPVOID pData)
 	NotificationFilter.dbch_size = sizeof(DEV_BROADCAST_HANDLE32);
 	NotificationFilter.dbch_devicetype = DBT_DEVTYP_HANDLE;
 
-	HDEVNOTIFY hDevNotify = RegisterDeviceNotification(hService, &NotificationFilter, DEVICE_NOTIFY_SERVICE_HANDLE);
-	if (NULL == hDevNotify)
-	{
-		OutputDebugString(_T("Unable to Register the DeviceNotification"));
-		//return;
-	}
 
 	//Register Power Setting Notification Infrastructure
 	//  The Windows Service needs to register for power events of system state transitioning.
 	LPCGUID PowerSettingGuid = &GUID_CONSOLE_DISPLAY_STATE;
-	HPOWERNOTIFY hPwrNotify = RegisterPowerSettingNotification(hService, PowerSettingGuid, DEVICE_NOTIFY_SERVICE_HANDLE);
+	hPwrNotify = RegisterPowerSettingNotification(hService, PowerSettingGuid, DEVICE_NOTIFY_SERVICE_HANDLE);
 	if (hPwrNotify == NULL) {
 		OutputDebugString(_T("Unable to Register the Power Setting Notification"));
 		return 1;
 	}
 
-	//while (1)
+	return 0;
+}
+
+DWORD WINAPI DisplayOffHandler(LPVOID pData)
+{
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	std::string fmtStr;
+	TCHAR szTimeStamp[MAX_PATH] = { 0 };
+	swprintf_s(szTimeStamp, MAX_PATH, _T("%.2d/%.2d/%.2d %.2d:%.2d:%.2d"), st.wMonth, st.wDay, st.wYear, st.wHour, st.wMinute, st.wSecond);
+
+	TCHAR szComputerName[MAX_COMPUTERNAME_LENGTH + 1] = { 0 };
+	DWORD dwSize = (MAX_COMPUTERNAME_LENGTH + 1);
+	GetComputerName(szComputerName, &dwSize);
+
+	TCHAR szFileName[MAX_PATH] = { 0 };
+	PWSTR szPath = NULL;
+	HANDLE hToken = NULL;
+	OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
+	HRESULT hRes = SHGetKnownFolderPath(FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, hToken, &szPath);
+
+	if (SUCCEEDED(hRes))
 	{
-		
-		//Run for the First Time by checking the Display
-		//Wait 
-		//	On Display Idle Timer times out, then Service will get notification from the System for going into Sleep stateand will turn off the display.
-		while (1) //WAIT_OBJECT_0 == WaitForSingleObject(hTimer, 500))
+		TCHAR szIPAddress[MAX_IPV4] = { 0 };
+		GetPublicIPAddress(szIPAddress);
+
+		_tcscpy_s(szFileName, MAX_PATH, (TCHAR*)szPath);
+
+		PathAppend(szFileName, _T("Kiewit\\Kiewit.txt"));
+
+		FILE* fp = NULL;
+		int err = _wfopen_s(&fp, szFileName, _T("w"));
+		OutputDebugString(_T("szFileName"));
+		OutputDebugString(szFileName);
+		if (!err)
 		{
-			if (WAIT_OBJECT_0 == WaitForSingleObject(hDisplayOffEvent, INFINITE/*1000*/))
-			{
-				//The Display is Off
-				//	During this handling a text file would be created with the Time Stamp and update it with Computer Name and its Location details.
-				//PBT_APMSUSPEND is the event that would be sent by the System during this time and the handler needs to perform the task 
-				//i.e.writing information to the file in 2 seconds.
-				SYSTEMTIME st;
-				GetLocalTime(&st);
-
-				std::string fmtStr;
-				TCHAR szTimeStamp[MAX_PATH] = { 0 };
-				swprintf_s(szTimeStamp, MAX_PATH, _T("%.2d/%.2d/%.2d %.2d:%.2d:%.2d"), st.wMonth, st.wDay, st.wYear, st.wHour, st.wMinute, st.wSecond);
-
-				TCHAR szComputerName[MAX_COMPUTERNAME_LENGTH + 1] = { 0 };
-				DWORD dwSize = sizeof(TCHAR) * (MAX_COMPUTERNAME_LENGTH + 1);
-				GetComputerName(szComputerName, &dwSize);
-
-				PWSTR szPath = NULL ; 
-				HANDLE hToken = NULL;
-				OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
-				HRESULT hRes = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, hToken, &szPath);
-
-				if (SUCCEEDED(hRes))
-				{
-					TCHAR szIPAddress[MAX_IPV4] = { 0 };
-					GetPublicIPAddress(szIPAddress);
-
-					_tcscpy_s(szFileName, MAX_PATH * sizeof(TCHAR), ( TCHAR *)szPath);
-
-					PathAppend(szFileName, _T("Kiewit.txt"));
-
-					FILE* fp = NULL;
-					int err = _wfopen_s(&fp, szFileName, _T("w"));
-					OutputDebugString(_T("szFileName"));
-					OutputDebugString(szFileName);
-					if (!err)
-					{
-						_ftprintf_s(fp, _T("%s %s %s"), szTimeStamp, szComputerName, szIPAddress);
-						OutputDebugString(szTimeStamp);
-						OutputDebugString(szComputerName);
-						OutputDebugString(szIPAddress);
-					}
-
-					ResetEvent(hDisplayOffEvent);
-
-					if ( NULL != fp )
-						fclose(fp);
-
-					CoTaskMemFree(szPath);
-				}
-
-				//break;
-			}
-
-			Sleep(2000);
+			_ftprintf_s(fp, _T("%s %s %s"), szTimeStamp, szComputerName, szIPAddress);
+			OutputDebugString(szTimeStamp);
+			OutputDebugString(szComputerName);
+			OutputDebugString(szIPAddress);
 		}
 
-		//	Now to identify the Wake up - If the system wakes due to user activity(sends PBT_APMRESUMEAUTOMATIC event followed by a PBT_APMRESUMESUSPEND event), the system does not automatically return to sleep based on the unattended idle timer.Instead the system returns to sleep based on the system idle timer.
-		//	On Wakeup detected by the Service the delete the created file and enters into the idle state for a configurable time with some configurator application.
-#if 0
-		// Set a timer to wait for 5 mins.
-		if (!SetWaitableTimer(hTimer, &liDueTime, 0, NULL, NULL, 0))
-		{
-			//LogEvent(_T("SetWaitableTimer failed (%d)\n"), GetLastError());
-			return -1;
-		}
-#endif
+		if (NULL != fp)
+			fclose(fp);
 
-		// Wait for the timer.
-		/*if (WaitForSingleObject(hTimer, INFINITE) != WAIT_OBJECT_0)
-			printf("WaitForSingleObject failed (%d)\n", GetLastError());
-		else printf("Timer was signaled.\n");*/
+		CoTaskMemFree(szPath);
 	}
 
 	return 0;
@@ -382,6 +370,7 @@ DWORD WINAPI DisplayTimerThread(LPVOID pData)
 
 void GetPublicIPAddress(TCHAR* szIPAddress)
 {
+	TCHAR szFileName[MAX_PATH] = { 0 };
 	PWSTR szPath = NULL; 
 	HANDLE hToken = NULL;
 	OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken);
@@ -390,7 +379,7 @@ void GetPublicIPAddress(TCHAR* szIPAddress)
 	if (SUCCEEDED(hRes))
 	{
 		PathAppend(szPath, _T("Kiewit"));
-		_tcscpy_s(szFileName, MAX_PATH * sizeof(TCHAR), szPath);
+		_tcscpy_s(szFileName, MAX_PATH, szPath);
 		
 		if (!PathFileExists(szFileName))
 		{
@@ -407,8 +396,7 @@ void GetPublicIPAddress(TCHAR* szIPAddress)
 		if (!err)
 		{
 			OutputDebugString(szFileName);
-			_ftprintf_s(fp, _T("@echo off\ncd %s\nnslookup myip.opendns.com resolver1.opendns.com > publicip.txt\nFIND \"Address\" publicip.txt > OnlyIP.txt\nfor /F \"skip=3 delims=\" %%%%i in (OnlyIP.txt) do set data = \"%%%%i\"\nFOR /f \"tokens=1,2 delims=:\" %%%%a IN(\"%%data%%\") do set data = %%%%b\nset data = %%data:~1,-1%%\necho %%data%% > OnlyIP.txt\n"), szPath);
-			//_ftprintf_s(fp, _T("@echo on\nfor /F \"skip=3 delims=\" %%%%i in (OnlyIP.txt) do set data = \"%%%%i\"\nFOR /f \"tokens=1,2 delims=:\" %%%%a IN(\"%%data%%\") do set data = %%%%b\nset data = %%data:~1,-1%%\nreg add HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\DetectMonitorStatus /v IPAddress /t REG_SZ /d %%data%%\nmore\n"));
+			_ftprintf_s(fp, _T("@echo off\ncd \"%s\"\nnslookup myip.opendns.com resolver1.opendns.com > publicip.txt\nFIND \"Address\" publicip.txt > \"OnlyIP.txt\"\ndel publicip.txt\nFor /F \"skip=3 delims=\" %%%%i in (OnlyIP.txt) do set data=\"%%%%i\"\ndel OnlyIP.txt\nFor /f \"tokens=1,2 delims=:\" %%%%a IN (\"%%data%%\") do set data=%%%%b\nset data=%%data:~1,-1%%\necho %%data%% > IP.txt\n"), szPath);
 		}
 
 		fclose(fp);
@@ -421,111 +409,22 @@ void GetPublicIPAddress(TCHAR* szIPAddress)
 	si.cb = sizeof(si);
 	ZeroMemory(&pi, sizeof(pi));
 
-	LPTSTR pszOldVal = new TCHAR[BUFSIZE] ;
-	DWORD dwRet = GetEnvironmentVariable(VARNAME, pszOldVal, BUFSIZE);
-	DWORD dwErr;
-	BOOL fExist = FALSE;
-	if (0 == dwRet)
-	{
-		dwErr = GetLastError();
-		if (ERROR_ENVVAR_NOT_FOUND == dwErr)
-		{
-			OutputDebugString(_T("Environment variable does not exist.\n"));
-			fExist = FALSE;
-		}
-	}
-	else if (BUFSIZE < dwRet)
-	{
-		delete[] pszOldVal;
-		pszOldVal = (LPTSTR)new TCHAR[ dwRet ];
-		if (NULL == pszOldVal)
-		{
-			printf("Out of memory\n");
-			return ;
-		}
-		dwRet = GetEnvironmentVariable(VARNAME, pszOldVal, dwRet);
-		if (!dwRet)
-		{
-			printf("GetEnvironmentVariable failed (%d)\n", GetLastError());
-			return ;
-		}
-		else fExist = TRUE;
-	}
-	else 
-		fExist = TRUE;
+	DWORD dwErr = 0;
+	TCHAR szCmd[] = _T("C:\\Windows\\system32\\cmd.exe");
 
-	// Set a value for the child process to inherit. 
-
-	if (!SetEnvironmentVariable(VARNAME, TEXT("IP")))
-	{
-		printf("SetEnvironmentVariable failed (%d)\n", GetLastError());
-		return ;
-	}
-#if 0
-	/*HANDLE*/ hToken = INVALID_HANDLE_VALUE;
-	PWTS_SESSION_INFO pwsi = nullptr;
-	DWORD dwCount = 0;
-
-	if (WTSEnumerateSessions(WTS_CURRENT_SERVER, 0, 1, &pwsi, &dwCount))
-	{
-		for (DWORD i = 0; i < dwCount; i++)
-		{
-			PWTS_SESSION_INFO pi = &pwsi[i];
-			if (pi->State == WTSActive)
-			{
-				WTSQueryUserToken(pi->SessionId, &hToken);
-				break;
-			}
-		}
-	}
-
-	if (pwsi)
-		WTSFreeMemory(pwsi);
-
-	LPVOID lpEnvironment = nullptr;
-	if (hToken != INVALID_HANDLE_VALUE)
-	{
-		//LPVOID lpEnvironment = nullptr;
-		LPWSTR pszPath = nullptr;
-
-		//if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, hToken, &pszPath))) // Get Documents Folder to set as working directory
-		{
-			if (CreateEnvironmentBlock(&lpEnvironment, hToken, FALSE))
-			{
-				TCHAR szCmd[BUFSIZE] = { _T("cmd /C ") };
-				_tcscat_s(szCmd, MAX_PATH * sizeof(TCHAR), szFileName);
-
-				STARTUPINFO si = { sizeof(STARTUPINFO) };
-				PROCESS_INFORMATION pi;
-
-				if (CreateProcessAsUser(hToken, szCmd, nullptr, nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT,
-					lpEnvironment, pszPath, &si, &pi))
-				{
-					/*CloseHandle(pi.hThread);
-					CloseHandle(pi.hProcess);*/
-				}
-
-				//DestroyEnvironmentBlock(lpEnvironment);
-			}
-
-			//CoTaskMemFree(pszPath);
-		}
-
-		CloseHandle(hToken);
-	}
-#endif
-
-//#if 0
-	// Start the child process. 
-	TCHAR szCmd[BUFSIZE] = { _T("cmd /C " ) }; //cmd /C 
-	_tcscat_s(szCmd, MAX_PATH * sizeof(TCHAR), szFileName);
-#if 0
-	if (!CreateProcess(NULL,   // No module name (use command line)
-		szCmd,        // Command line
+	hToken = NULL;
+	TCHAR szCmdLine[MAX_PATH] = { _T("/C ") };
+	TCHAR szFileNameWithQuotes[MAX_PATH] = { _T("") };
+	swprintf_s(szFileNameWithQuotes, MAX_PATH, _T("\"%s\""), szFileName);
+	_tcscat_s(szCmdLine, MAX_PATH, szFileNameWithQuotes );
+			
+	if (!CreateProcess(
+		szCmd,   // No module name (use command line)
+		szCmdLine,        // Command line
 		NULL,           // Process handle not inheritable
 		NULL,           // Thread handle not inheritable
 		FALSE,          // Set handle inheritance to FALSE
-		CREATE_UNICODE_ENVIRONMENT|CREATE_NEW_CONSOLE,              // No creation flags
+		CREATE_UNICODE_ENVIRONMENT,              // No creation flags
 		NULL,           // Use parent's environment block
 		NULL,           // Use parent's starting directory 
 		&si,            // Pointer to STARTUPINFO structure
@@ -533,28 +432,19 @@ void GetPublicIPAddress(TCHAR* szIPAddress)
 		)
 	{
 		printf("CreateProcess failed (%d).\n", GetLastError());
+		dwErr = GetLastError();
 		return;
 	}
-#endif
-	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-	SHELLEXECUTEINFO shExeInfo = { 0 } ;
-	shExeInfo.cbSize = sizeof(SHELLEXECUTEINFO);
-	shExeInfo.fMask = SEE_MASK_NOCLOSEPROCESS;
-	shExeInfo.hwnd = NULL;
-	shExeInfo.lpVerb = L"open";
-	shExeInfo.lpFile = szCmd;
-	//shExeInfo.lpParameters = L"\"test param\"";
-	shExeInfo.lpDirectory = NULL;
-	shExeInfo.nShow = SW_SHOW;
-	shExeInfo.hInstApp = NULL;
-	ShellExecuteEx(&shExeInfo);
-
-	WaitForSingleObject(shExeInfo.hProcess, INFINITE);
+	else
+		dwErr = GetLastError();
 
 
-	_tcscpy_s(szFileName, MAX_PATH * sizeof(TCHAR), szPath);
+	WaitForSingleObject(pi.hProcess, INFINITE);
 
-	PathAppend(szFileName, _T("OnlyIP.txt"));
+
+	_tcscpy_s(szFileName, MAX_PATH, szPath);
+
+	PathAppend(szFileName, _T("IP.txt"));
 	if (PathFileExists(szFileName))
 	{
 		FILE* fp = NULL;
@@ -563,14 +453,11 @@ void GetPublicIPAddress(TCHAR* szIPAddress)
 		if (!err)
 		{
 			OutputDebugString(szFileName);
-			_ftscanf_s(fp, _T("%s"), szIPAddress);
+			fgetws(szIPAddress, MAX_IPV4, fp);
 		}
 
 		fclose(fp);
 
-		GetEnvironmentVariable(VARNAME, szIPAddress, MAX_IPV4);
-		TCHAR* szEnv = GetEnvironmentStrings();
-		OutputDebugString(szEnv);
 		OutputDebugString(_T("szIPAddress"));
 		OutputDebugString(szIPAddress);
 	}
@@ -578,8 +465,7 @@ void GetPublicIPAddress(TCHAR* szIPAddress)
 	// Close process and thread handles. 
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);
+	DeleteFile(szFileName); //IP.txt
 
-	//DestroyEnvironmentBlock(lpEnvironment);
 	CoTaskMemFree(szPath);
-	delete[] pszOldVal;
 }
